@@ -3,16 +3,11 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, random_split, Subset
 import torchvision.datasets as datasets
-# Flower 提供的联邦数据集加载工具
-from flwr_datasets import FederatedDataset
-# 将数据划分为多个“独立同分布”的客户端分区
-from flwr_datasets.partitioner import IidPartitioner
 from torch.utils.data import DataLoader
-# 图像预处理工具
+from torch.utils.data import random_split
 from torchvision.transforms import Compose, Normalize, ToTensor
-
+import torchvision.transforms as transforms
 
 class Net(nn.Module):
     """Model (simple CNN adapted from 'PyTorch: A 60 Minute Blitz')"""
@@ -43,10 +38,6 @@ fds = None  # Cache FederatedDataset
 # 这里用 (0.5, 0.5, 0.5) 是为了把 [0,1] 映射到 [-1,1]
 pytorch_transforms = Compose([ToTensor(), Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
 
-
-
-import torchvision.transforms as transforms
-
 # 图像预处理（和原来一致）
 transform_train = transforms.Compose([
     transforms.RandomCrop(32, padding=4),
@@ -60,46 +51,57 @@ transform_test = transforms.Compose([
     transforms.Normalize((0.4914, 0.4822, 0.4465), (0.247, 0.243, 0.261)),
 ])
 
-
-def apply_transforms(batch):
-    """Apply transforms to the partition from FederatedDataset."""
-    batch["img"] = [pytorch_transforms(img) for img in batch["img"]]
-    return batch
-
-
-
 def load_data(partition_id: int, num_partitions: int):
     """
-    Load CIFAR-10 data from local disk and partition it into `num_partitions`.
-    Each client gets a non-overlapping subset.
+    加载并划分CIFAR-10数据集，为联邦学习中的某个客户端返回其本地的训练和测试数据加载器。
+
+    参数:
+        partition_id (int): 当前客户端的ID（从0开始）。
+        num_partitions (int): 将训练集划分为多少个部分（即客户端总数）。
+
+    返回:
+        tuple: 包含训练数据加载器(trainloader)和测试数据加载器(testloader)的元组。
     """
-    # Step 1: Download or load CIFAR-10 locally
+
+    # 1. 下载并加载完整的CIFAR-10训练集和测试集
+    # `root="./data"` 指定数据存储目录
+    # `train=True` 表示加载训练集
+    # `download=True` 如果本地没有数据，则自动下载
+    # `transform=transform_train` 应用预定义的数据增强和归一化变换
     trainset = datasets.CIFAR10(root="./data", train=True, download=True, transform=transform_train)
     testset = datasets.CIFAR10(root="./data", train=False, download=True, transform=transform_test)
 
-    # Step 2: Split training set into `num_partitions` equal parts (non-IID 模式可后续扩展)
-    total_size = len(trainset)
-    partition_size = total_size // num_partitions
-    lengths = [partition_size] * num_partitions
-    # 处理不能整除的情况
+    # 2. 计算每个数据分区（客户端）应分配到的样本数量
+    total_size = len(trainset)  # 获取训练集总样本数 (50000 for CIFAR-10)
+    partition_size = total_size // num_partitions  # 计算每个分区的基础大小
+    lengths = [partition_size] * num_partitions  # 创建一个列表，每个元素代表一个分区的大小
+
+    # 3. 处理无法整除的情况：将余下的样本分配给最后一个分区
+    # 例如，50000个样本分给3个客户端，前两个各16666，最后一个16668
     lengths[-1] += total_size - sum(lengths)
 
-    # 随机划分数据（模拟 IID 分布）
+    # 4. 将训练集随机划分为num_partitions个不相交的子集
+    # 使用`random_split`函数进行划分
+    # `generator=torch.Generator().manual_seed(42)` 确保划分结果可复现（相同的随机种子）
     partitions = random_split(trainset, lengths, generator=torch.Generator().manual_seed(42))
 
-    # Step 3: Select the partition for this client
+    # 5. 为当前客户端（由partition_id指定）选择对应的训练数据分区
     train_partition = partitions[partition_id]
 
-    # Step 4: Use same test set for all clients (or optionally also split)
-    # 如果你也想让每个客户端有自己的测试集，可以类似划分 testset
+    # 6. 测试集不分割，所有客户端共享同一个全局测试集
+    # 这样可以统一评估模型在相同测试数据上的性能
     test_partition = testset
 
-    # Step 5: Create DataLoaders
+    # 7. 创建数据加载器(DataLoader)，用于批量读取数据
+    # 训练数据加载器：使用客户端的训练分区，batch_size=32，并打乱顺序(shuffle=True)以提高训练效果
     trainloader = DataLoader(train_partition, batch_size=32, shuffle=True)
-    testloader = DataLoader(test_partition, batch_size=32, shuffle=False)  # 全局测试集不打乱
 
+    # 测试数据加载器：使用完整的测试集，batch_size=32，不打乱顺序(shuffle=False)
+    # 通常测试时不需打乱，且保持一致的顺序有助于结果比较
+    testloader = DataLoader(test_partition, batch_size=32, shuffle=False)
+
+    # 8. 返回该客户端的训练和测试数据加载器
     return trainloader, testloader
-
 
 def train(net, trainloader, epochs, lr, device):
     """Train the model on the training set."""
@@ -164,10 +166,7 @@ def test(net, testloader, device):
 
 
 
-# partition_id: 我是第几个客户端
-# num_partitions: 把整个数据集平均分成多少份，每一份给一个“客户端”（client）使用。
-# num_partitions = 10 → 把数据分成 10 份，发给 10 个客户端
-# num_partitions = 100 → 分成 100 份，发给 100 个客户端
+
 # def load_data(partition_id: int, num_partitions: int):
 #     """Load partition CIFAR10 data."""
 #     # Only initialize `FederatedDataset` once
